@@ -2,7 +2,7 @@
 // 方針: つながるときは必ずネットの最新版を使い、その写しを控えておく。つながらないときだけ控えを出す。
 // こうしておくと「更新したのに古い画面のまま」が起きない。
 
-const CACHE = 'mimikopi-v1';
+const CACHE = 'mimikopi-v2';
 const ABCJS = 'https://cdn.jsdelivr.net/npm/abcjs@6.4.4/dist/abcjs-basic-min.js';
 const PRECACHE = ['./', 'manifest.webmanifest', 'icons/apple-touch-icon.png', 'icons/icon-192.png', ABCJS];
 

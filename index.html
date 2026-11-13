@@ -162,9 +162,24 @@ button, select, input, label { touch-action: manipulation; }
 .paper { background: var(--paper); color: var(--paper-ink); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; min-height: 120px; }
 .paper svg .hl, .paper svg .hl path { fill: #2452c7 !important; stroke: #2452c7 !important; }
 .paper-msg { margin: 24px 0; font-size: 13.5px; color: #555b6b; }
-.solfa { font-size: 14px; line-height: 2; padding: 10px 14px; background: var(--surface2); border: 1px solid var(--line); border-radius: 10px; overflow-wrap: anywhere; }
-.solfa b { font-weight: 400; color: var(--muted); margin: 0 6px; }
-.solfa .lab { display: block; font-size: 11.5px; letter-spacing: .08em; color: var(--muted); line-height: 1.6; }
+.solfa { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; background: var(--surface2); border: 1px solid var(--line); border-radius: 12px; }
+.solfa-head { display: flex; align-items: baseline; gap: 6px 12px; flex-wrap: wrap; }
+.solfa-head .lab { font-size: 13px; font-weight: 700; letter-spacing: .06em; }
+.solfa-head .note { font-size: 12.5px; color: var(--muted); min-width: 0; }
+.solfa-line { display: flex; flex-wrap: wrap; gap: 10px 0; font-size: 20px; font-weight: 600; line-height: 1.5; padding-top: 4px; }
+.solfa-line .bar { white-space: nowrap; padding: 0 12px; border-left: 2px solid var(--line); }
+.syl { position: relative; display: inline-block; margin-right: .5em; }
+.syl:last-child { margin-right: 0; }
+.syl.rest { color: var(--muted); font-weight: 400; }
+/* 点が上＝1オクターブ上、点が下＝1オクターブ下 */
+.syl.up::before, .syl.down::after { content: "•"; position: absolute; left: .5em; transform: translateX(-50%); font-size: .5em; line-height: 1; color: var(--accent); }
+.syl.up::before { top: -.45em; }
+.syl.down::after { bottom: -.5em; }
+.chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+.chip { font: inherit; font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; cursor: pointer; }
+.chip:hover { border-color: var(--accent); }
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.chip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 600; }
 .note-foot { color: var(--muted); font-size: 12.5px; line-height: 1.8; }
 .note-foot p { margin: 0; }
 
@@ -179,6 +194,7 @@ button, select, input, label { touch-action: manipulation; }
   .btn.small { min-height: 40px; padding: 6px 12px; }
   .ctl select, .ctl input[type="number"], .ctl input[type="text"], .in-box input[type="number"] { font-size: 16px; min-height: 44px; }
   .seg label { padding: 9px 16px; }
+  .chip { min-height: 40px; padding: 8px 14px; }
   .check { min-height: 36px; }
   .check input { width: 20px; height: 20px; }
 }
@@ -279,8 +295,19 @@ button, select, input, label { touch-action: manipulation; }
       <span class="l-fix">スケールに合わせて直した音</span>
     </p>
 
+    <div class="solfa no-print">
+      <div class="solfa-head">
+        <span class="lab" id="solfaLab">ドレミ</span>
+        <span class="note" id="solfaNote"></span>
+      </div>
+      <div class="solfa-line" id="solfa"></div>
+      <div class="chips" id="keyChips"></div>
+    </div>
+
     <div class="controls no-print">
       <label class="ctl"><span>キー</span><select id="keySel"></select></label>
+      <label class="ctl"><span>ドレミの読み方</span>
+        <select id="solfaSel"><option value="movable">キーに合わせる（階名）</option><option value="fixed">ドはいつもC（音名）</option></select></label>
       <div class="ctl wide"><span>テンポ（BPM）</span>
         <div class="row">
           <input type="number" id="bpmNum" min="30" max="300" step="1" aria-label="テンポ">
@@ -306,11 +333,11 @@ button, select, input, label { touch-action: manipulation; }
       <div class="ctl wide"><span>仕上げ</span>
         <label class="check"><input type="checkbox" id="tuneChk" checked> 音程のずれを自動でそろえる</label>
         <label class="check"><input type="checkbox" id="fillChk" checked> 短い休符は音をのばして埋める</label>
+        <label class="check"><input type="checkbox" id="solfaChk" checked> 楽譜と図にもドレミを書きこむ</label>
       </div>
     </div>
 
     <div class="paper" id="paperWrap"><div id="paper"></div></div>
-    <div class="solfa no-print" id="solfa"></div>
 
     <div class="row no-print">
       <button class="btn primary" id="midiBtn" type="button"><span class="web-only">MIDIを保存</span><span class="app-only">MIDIを共有</span></button>
@@ -781,6 +808,19 @@ const ACC_TXT = { '-2': '𝄫', '-1': '♭', '0': '', '1': '♯', '2': '𝄪' };
 function noteName(midi, key) { const sp = spellPitch(midi, key); return sp.letter + ACC_TXT[sp.acc] + sp.oct; }
 const SOLFA = { C: 'ド', D: 'レ', E: 'ミ', F: 'ファ', G: 'ソ', A: 'ラ', B: 'シ' };
 
+// ドレミの読み方。movable=true のときは、キーの主音を「ド」として読む（階名・移動ド）。
+// 短調は、同じ調号の長調の主音を「ド」にする（短調の主音は「ラ」になる）。
+// こうしておくと、長調か短調かの判定が外れても、ドレミの読みは変わらない。
+const DEG = ['ド', 'レ', 'ミ', 'ファ', 'ソ', 'ラ', 'シ'], LETTERS = 'CDEFGAB';
+const doLetterOf = (key) => LOF[(((key.fifths + 1) % 7) + 7) % 7];
+const doPcOf = (key, movable) => (!movable ? 0 : key.minor ? (key.tonic + 3) % 12 : key.tonic);
+function solfaOf(midi, key, movable) {
+  const sp = spellPitch(midi, key);
+  if (!movable) return SOLFA[sp.letter] + ACC_TXT[sp.acc];
+  const deg = (LETTERS.indexOf(sp.letter) - LETTERS.indexOf(doLetterOf(key)) + 7) % 7;
+  return DEG[deg] + (ACC_TXT[sp.acc - keyAcc(sp.letter, key.fifths)] || '');
+}
+
 /* ============================================================
    テンポとリズム
    ============================================================ */
@@ -880,7 +920,8 @@ function buildAbc(q, opt) {
   for (const nt of q) { if (nt.s > pos) ev.push({ s: pos, e: nt.s, rest: true }); ev.push(nt); pos = nt.e; }
   if (pos < total) ev.push({ s: pos, e: total, rest: true });
 
-  let body = '', line = '', bars = 0, barAcc = {};
+  // opt.syllable があれば、音符の下に歌詞としてドレミを並べる（タイでつないだ続きの音には書かない）
+  let body = '', line = '', wline = '', bars = 0, barAcc = {};
   for (const e of ev) {
     let s = e.s, first = true;
     while (s < e.e) {
@@ -898,6 +939,7 @@ function buildAbc(q, opt) {
           const nm = sp.oct >= 5 ? sp.letter.toLowerCase() + "'".repeat(sp.oct - 5) : sp.letter + ','.repeat(4 - sp.oct);
           line += sym + nm + (d > 1 ? d : '');
           if (s - barPos + pp + d < e.e) line += '-';
+          if (opt.syllable) wline += (first ? opt.syllable(e) : '*') + ' ';
           first = false;
         }
         pp += d;
@@ -907,7 +949,11 @@ function buildAbc(q, opt) {
         bars++; barAcc = {};
         const last = s >= total;
         line += last ? ' |]' : ' |';
-        if (last || bars % opt.barsPerLine === 0) { body += line + '\n'; line = ''; } else line += ' ';
+        if (last || bars % opt.barsPerLine === 0) {
+          body += line + '\n';
+          if (/[^\s|*]/.test(wline)) body += 'w: ' + wline.trim() + '\n';
+          line = ''; wline = '';
+        } else { line += ' '; wline += '| '; }
       }
     }
   }
@@ -938,7 +984,7 @@ function buildMidi(d) {
 const state = {
   samples: null, origBuf: null, label: '', mode: 'mono',
   track: null, notes: null, tuning: 0, duration: 0,
-  settings: { key: 'auto', bpm: 'auto', meter: 4, grid: 1, snap: 1, octave: 'auto', pickup: 0, fill: true, tuneFix: true, title: '' },
+  settings: { key: 'auto', bpm: 'auto', meter: 4, grid: 1, snap: 1, octave: 'auto', pickup: 0, fill: true, tuneFix: true, title: '', solfa: 'movable', solfaOn: true },
   derived: null, visual: null, pps: 80,
 };
 
@@ -981,10 +1027,13 @@ function renderStats(d) {
 }
 
 function renderScore(d) {
-  const paper = $('paper'), w = $('paperWrap').clientWidth - 34;
-  d.abc = buildAbc(d.q, { title: state.settings.title, bpm: d.bpm, meter: d.meter, key: d.key, barsPerLine: w < 560 ? 2 : 4 });
+  const paper = $('paper'), w = $('paperWrap').clientWidth - 34, set = state.settings;
+  d.abc = buildAbc(d.q, {
+    title: set.title, bpm: d.bpm, meter: d.meter, key: d.key, barsPerLine: w < 560 ? 2 : 4,
+    syllable: set.solfaOn ? (nt) => solfaOf(nt.out, d.key, set.solfa === 'movable') : null,
+  });
   if (!window.ABCJS) {
-    paper.innerHTML = '<p class="paper-msg">楽譜の部品（abcjs）を読み込めませんでした。ネットにつながった状態で開き直すと楽譜が表示されます。下の音名とMIDI保存は使えます。</p>';
+    paper.innerHTML = '<p class="paper-msg">楽譜の部品（abcjs）を読み込めませんでした。ネットにつながった状態で開き直すと楽譜が表示されます。上のドレミとMIDI保存は使えます。</p>';
     state.visual = null; return;
   }
   // タイトルは紙の幅に収まる大きさにする（abcjsの文字サイズはポイント指定で、画面上は約1.33倍になる）
@@ -992,20 +1041,61 @@ function renderScore(d) {
   state.visual = ABCJS.renderAbc(paper, d.abc, {
     responsive: 'resize', staffwidth: clamp(w, 300, 900), add_classes: true,
     paddingleft: 0, paddingright: 0, paddingtop: 10, paddingbottom: 10,
-    format: { titlefont: 'sans-serif ' + Math.round(titlePx * 0.75) + ' bold' },
+    format: { titlefont: 'sans-serif ' + Math.round(titlePx * 0.75) + ' bold', vocalfont: 'sans-serif 10' },
   });
 }
 
+// ドレミ欄: 小節ごとに区切り、のばす音は「ー」、1拍以上の休みは「・」で表す
 function renderSolfa(d) {
-  const el = $('solfa'), barLen = d.meter * 4; el.textContent = '';
-  const lab = document.createElement('span'); lab.className = 'lab'; lab.textContent = '音名（ドレミ）'; el.appendChild(lab);
-  let bar = 0;
+  const set = state.settings, movable = set.solfa === 'movable', barLen = d.meter * 4;
+  const majPc = d.key.minor ? (d.key.tonic + 3) % 12 : d.key.tonic;
+  $('solfaLab').textContent = movable ? 'ドレミ（階名）' : 'ドレミ（音名）';
+
+  // いちばん多く使われている「ド〜シ」の1オクターブを基準にして、それより上・下の音に点をつける
+  const doPc = doPcOf(d.key, movable), octOf = (m) => Math.floor((m - doPc) / 12), count = {};
+  for (const nt of d.q) count[octOf(nt.out)] = (count[octOf(nt.out)] || 0) + (nt.e - nt.s);
+  const baseOct = Number(Object.keys(count).sort((a, b) => count[b] - count[a])[0]);
+
+  const el = $('solfa'); el.textContent = '';
+  let bar = null, barIdx = -1, pos = 0, dots = false;
+  const add = (barNo, cls, text) => {
+    if (barNo !== barIdx) { bar = document.createElement('span'); bar.className = 'bar'; el.appendChild(bar); barIdx = barNo; }
+    const sp = document.createElement('span'); sp.className = cls; sp.textContent = text; bar.appendChild(sp);
+  };
   for (const nt of d.q) {
-    const b = Math.floor(nt.s / barLen);
-    if (b !== bar) { const sep = document.createElement('b'); sep.textContent = '|'; el.appendChild(sep); bar = b; }
-    const sp = spellPitch(nt.out, d.key);
-    el.appendChild(document.createTextNode(SOLFA[sp.letter] + ACC_TXT[sp.acc] + ' '));
+    for (let p = Math.ceil(pos / 4) * 4; p + 4 <= nt.s; p += 4) add(Math.floor(p / barLen), 'syl rest', '・');
+    const o = octOf(nt.out), ext = Math.max(0, Math.round((nt.e - nt.s) / 4) - 1);
+    if (o !== baseOct) dots = true;
+    add(Math.floor(nt.s / barLen), 'syl' + (o > baseOct ? ' up' : o < baseOct ? ' down' : ''), solfaOf(nt.out, d.key, movable) + 'ー'.repeat(ext));
+    pos = nt.e;
   }
+
+  const how = set.key === 'auto' ? '自動で判定' : '手動で指定';
+  let note = movable
+    ? 'キーは ' + d.key.label + '（' + how + '）。' + MAJ_NAMES[majPc] + ' を「ド」として読んでいます' + (d.key.minor ? '（' + MIN_NAMES[d.key.tonic] + ' が「ラ」）' : '') + '。'
+    : 'キーに関係なく、C を「ド」として読んでいます。';
+  if (dots) note += ' 点が上の音は1オクターブ上、下の音は1オクターブ下です。';
+  $('solfaNote').textContent = note;
+
+  // キーの候補。同じ調号の長調と短調はドレミの読みが同じなので、調号ごとに1つだけ出す
+  const chips = $('keyChips'); chips.textContent = '';
+  const lead = document.createElement('span'); lead.textContent = 'ドレミが合わないときは、キーを選び直せます'; chips.appendChild(lead);
+  const seen = new Set(), list = [];
+  for (const c of d.cands) { if (seen.has(c.fifths)) continue; seen.add(c.fifths); list.push(c); if (list.length === 3) break; }
+  if (!seen.has(d.key.fifths)) list.unshift(d.key);
+  list.forEach((c) => {
+    const b = document.createElement('button'); b.type = 'button';
+    const isAuto = c === d.cands[0];
+    b.className = 'chip' + (c.fifths === d.key.fifths ? ' on' : '');
+    b.textContent = c.label + (isAuto ? '（自動）' : '');
+    b.onclick = () => {
+      stopPlayback();
+      set.key = isAuto ? 'auto' : c.tonic + (c.minor ? 12 : 0);
+      $('keySel').value = String(set.key);
+      refresh();
+    };
+    chips.appendChild(b);
+  });
 }
 
 function drawRoll() {
@@ -1063,6 +1153,20 @@ function drawRoll() {
     pen = true;
   }
   g.stroke(); g.globalAlpha = 1;
+
+  // 音符の上にドレミを書きこむ（細かい音が続いて重なるところは省く）
+  if (state.settings.solfaOn) {
+    const movable = state.settings.solfa === 'movable';
+    g.font = '600 11px "Hiragino Sans", "Yu Gothic UI", sans-serif'; g.fillStyle = col('--ink'); g.textBaseline = 'alphabetic';
+    let right = -Infinity;
+    for (const nt of d.q) {
+      const x0 = nt.src.t0 * pps;
+      if (x0 < right + 3) continue;
+      const txt = solfaOf(nt.out, d.key, movable), top = y(nt.midi) - h / 2;
+      g.fillText(txt, x0, top > 14 ? top - 3 : top + h + 12);
+      right = x0 + g.measureText(txt).width;
+    }
+  }
 }
 
 function refresh(scoreOnly) {
@@ -1453,6 +1557,16 @@ function init() {
   $('pickSel').onchange = upd(() => { set.pickup = parseInt($('pickSel').value, 10); });
   $('tuneChk').onchange = upd(() => { set.tuneFix = $('tuneChk').checked; });
   $('fillChk').onchange = upd(() => { set.fill = $('fillChk').checked; });
+  // ドレミの読み方の好みは、この端末に覚えておく
+  const savePrefs = () => { try { localStorage.setItem('mimi.prefs', JSON.stringify({ solfa: set.solfa, solfaOn: set.solfaOn })); } catch (e) { /* 覚えられなくても動作には影響なし */ } };
+  try {
+    const p = JSON.parse(localStorage.getItem('mimi.prefs') || '{}');
+    if (p.solfa === 'movable' || p.solfa === 'fixed') set.solfa = p.solfa;
+    if (typeof p.solfaOn === 'boolean') set.solfaOn = p.solfaOn;
+  } catch (e) { /* 初期値のまま使う */ }
+  $('solfaSel').value = set.solfa; $('solfaChk').checked = set.solfaOn;
+  $('solfaSel').onchange = upd(() => { set.solfa = $('solfaSel').value; savePrefs(); });
+  $('solfaChk').onchange = upd(() => { set.solfaOn = $('solfaChk').checked; savePrefs(); });
   $('titleInp').oninput = () => { set.title = $('titleInp').value; if (state.derived) renderScore(state.derived); };
 
   $('midiBtn').onclick = () => { if (state.derived) saveBlob(new Blob([buildMidi(state.derived)], { type: 'audio/midi' }), safeName(set.title) + '.mid'); };
