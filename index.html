@@ -319,7 +319,9 @@ button, select, input, label { touch-action: manipulation; }
       <label class="ctl"><span>拍子</span>
         <select id="meterSel"><option value="4">4/4</option><option value="3">3/4</option></select></label>
       <label class="ctl"><span>音符の細かさ</span>
-        <select id="gridSel"><option value="1">16分音符まで</option><option value="2">8分音符まで</option></select></label>
+        <select id="gridSel"><option value="2">8分音符まで（読みやすい）</option><option value="1">16分音符まで（細かい）</option></select></label>
+      <label class="ctl"><span>リズムの取り方</span>
+        <select id="rhythmSel"><option value="free">自由なテンポ（鼻歌向け）</option><option value="grid">一定のテンポ（クリック・曲向け）</option></select></label>
       <label class="ctl"><span>スケール補正</span>
         <select id="snapSel"><option value="0">なし（聴こえたまま）</option><option value="1" selected>ふつう</option><option value="2">強め（スケールの音だけ）</option></select></label>
       <label class="ctl"><span>オクターブ</span>
@@ -343,6 +345,7 @@ button, select, input, label { touch-action: manipulation; }
       <button class="btn primary" id="midiBtn" type="button"><span class="web-only">MIDIを保存</span><span class="app-only">MIDIを共有</span></button>
       <button class="btn" id="pngBtn" type="button"><span class="web-only">楽譜を画像で保存</span><span class="app-only">楽譜を画像で共有</span></button>
       <button class="btn" id="abcBtn" type="button">ABC譜をコピー</button>
+      <button class="btn" id="wavBtn" type="button"><span class="web-only">録音した音を保存</span><span class="app-only">録音した音を共有</span></button>
       <button class="btn web-only" id="printBtn" type="button">楽譜を印刷 / PDF</button>
     </div>
   </section>
@@ -588,81 +591,111 @@ async function trackMix(x, sr, onProgress) {
    ============================================================ */
 function buildNotes(track, minNoteSec) {
   const { midi, voiced, rms, hopSec } = track, n = midi.length;
-  const tol = 0.6;
-  const minChange = Math.max(2, Math.round(0.05 / hopSec));
   const maxGap = Math.max(1, Math.round(0.03 / hopSec));
   const minLen = Math.max(2, Math.round(minNoteSec / hopSec));
-  const ctrLen = Math.max(5, Math.round(0.3 / hopSec));
+  const LMIN = Math.max(2, Math.round(0.04 / hopSec)), WMAX = Math.round(3 / hopSec);
+  // 音を1つ増やすことの「値段」。大きいほど、ビブラートや音程のゆれで細切れになりにくい
+  const LAMBDA = 0.05 / hopSec;
 
-  // 1) 音程が変わったところ・声が切れたところで区切る
-  const segs = [];
-  let cur = null, pend = [], gap = 0;
-  const close = (end) => { if (cur) segs.push({ s: cur.start, e: end, soft: cur.soft }); cur = null; pend = []; gap = 0; };
+  // 1) 声が続いている区間に分ける（ごく短い途切れはつなぐ）
+  const runs = []; let a = -1, gap = 0;
   for (let f = 0; f < n; f++) {
-    if (!voiced[f]) { if (cur && ++gap > maxGap) close(f - gap + 1); continue; }
-    const m = midi[f];
-    if (!cur) { cur = { start: f, ms: [m], soft: false }; gap = 0; continue; }
-    gap = 0;
-    if (Math.abs(m - median(cur.ms.slice(-ctrLen))) <= tol) { cur.ms.push(m); pend = []; continue; }
-    pend.push({ f, m });
-    if (pend.length >= minChange) {
-      const last = pend.slice(-minChange);
-      let lo = Infinity, hi = -Infinity;
-      for (const p of last) { if (p.m < lo) lo = p.m; if (p.m > hi) hi = p.m; }
-      if (hi - lo <= tol) { const st = last[0].f, ms = last.map((p) => p.m); close(st); cur = { start: st, ms, soft: true }; }
-    }
+    if (voiced[f]) { if (a < 0) a = f; gap = 0; }
+    else if (a >= 0 && ++gap > maxGap) { runs.push([a, f - gap + 1]); a = -1; gap = 0; }
   }
-  if (cur) close(n - gap);
+  if (a >= 0) runs.push([a, n - gap]);
+  const p = new Float32Array(n);
+  for (const [s, e] of runs) { let last = midi[s]; for (let f = s; f < e; f++) { if (voiced[f]) last = midi[f]; p[f] = last; } }
 
-  // 2) 同じ高さの連打は、音量の谷で区切る
-  const segs2 = [];
-  for (const sg of segs) {
-    let segStart = sg.s, peak = 0, dipMin = Infinity, dipPos = -1, inDip = false, first = true;
-    for (let f = sg.s; f < sg.e; f++) {
+  // 2) 区間の中を「高さがほぼ一定のかたまり」に分ける。
+  //    分け方の候補を総当たりして、「かたまりの中のゆれ」＋「かたまりの数×値段」が最小になる分け方を選ぶ。
+  //    1フレームごとに判断しないので、人の声のふらつきや、音から音へなめらかに移る途中で迷いにくい。
+  const segs = [];
+  for (const [s, e] of runs) {
+    const m = e - s;
+    if (m < LMIN) continue;
+    const S1 = new Float64Array(m + 1), S2 = new Float64Array(m + 1);
+    for (let i = 0; i < m; i++) { const v = p[s + i]; S1[i + 1] = S1[i] + v; S2[i + 1] = S2[i] + v * v; }
+    const best = new Float64Array(m + 1).fill(Infinity), prev = new Int32Array(m + 1).fill(-1);
+    best[0] = 0;
+    for (let j = LMIN; j <= m; j++) {
+      for (let i = Math.max(0, j - WMAX); i <= j - LMIN; i++) {
+        if (best[i] === Infinity) continue;
+        const sum = S1[j] - S1[i], v = best[i] + (S2[j] - S2[i]) - (sum * sum) / (j - i) + LAMBDA;
+        if (v < best[j]) { best[j] = v; prev[j] = i; }
+      }
+    }
+    const cuts = []; let j = m;
+    while (j > 0 && prev[j] >= 0) { cuts.push([prev[j], j]); j = prev[j]; }
+    if (j !== 0) { segs.push({ s, e, hard: true }); continue; }
+    cuts.reverse().forEach(([i, jj], k) => segs.push({ s: s + i, e: s + jj, hard: k === 0 }));
+  }
+
+  // かたまりの高さ: 出だしのしゃくりと終わりの下がりを除いた中央値
+  const pitchOf = (s, e) => {
+    const arr = [], skip = Math.min(Math.round(0.1 / hopSec), Math.floor((e - s) * 0.25)), tail = Math.floor((e - s) * 0.1);
+    for (let f = s + skip; f < e - tail; f++) arr.push(p[f]);
+    if (!arr.length) for (let f = s; f < e; f++) arr.push(p[f]);
+    return median(arr);
+  };
+  const notes = segs.map((g) => ({ s: g.s, e: g.e, hard: g.hard, pitch: pitchOf(g.s, g.e) }));
+
+  // 3) 短すぎるかたまりと、「下からしゃくり上げる出だし」「音から音へ移る途中」は、となりの音にくっつける。
+  //    しゃくりや移り変わりは、短いうえに中で高さが動いているので、それで見分ける。
+  const slideLen = Math.round(0.18 / hopSec);
+  const trendOf = (s, e) => {
+    const third = Math.max(1, Math.floor((e - s) / 3));
+    return median(Array.from(p.subarray(e - third, e))) - median(Array.from(p.subarray(s, s + third)));
+  };
+  for (let i = 0; i < notes.length; i++) {
+    const nt = notes[i], len = nt.e - nt.s;
+    const pv = notes[i - 1], nx = notes[i + 1];
+    const pvAdj = !!pv && pv.e === nt.s && !nt.hard, nxAdj = !!nx && nx.s === nt.e && !nx.hard;
+    const tooShort = len < minLen;
+    const sliding = !tooShort && len < slideLen && (pvAdj || nxAdj) && Math.abs(trendOf(nt.s, nt.e)) >= 0.4;
+    if (!tooShort && !sliding) continue;
+    if (pvAdj || nxAdj) {
+      // 移り変わりの途中は「次の音の出だし」とみなす。短すぎるだけのものは、高さが近いほうへ
+      const toNext = sliding ? nxAdj : pvAdj && nxAdj ? Math.abs(nx.pitch - nt.pitch) <= Math.abs(pv.pitch - nt.pitch) : nxAdj;
+      if (toNext) { nx.s = nt.s; nx.hard = nt.hard; nx.pitch = pitchOf(nx.s, nx.e); } else pv.e = nt.e;
+    }
+    notes.splice(i, 1); i--;
+  }
+
+  // 4) 高さがほとんど同じで、あいだに音量の谷もない境目はつなぐ（ゆれで分かれただけなので）
+  const level = (x) => median(Array.from(rms.subarray(x.s, x.e)));
+  const dipAt = (x, y) => {
+    const w = Math.max(2, Math.round(0.06 / hopSec)); let mn = Infinity;
+    for (let f = Math.max(x.s, y.s - w); f < Math.min(y.e, y.s + w); f++) if (rms[f] < mn) mn = rms[f];
+    return mn < 0.6 * Math.min(level(x), level(y));
+  };
+  for (let i = 1; i < notes.length; i++) {
+    const x = notes[i - 1], y = notes[i];
+    if (y.s === x.e && !y.hard && Math.abs(x.pitch - y.pitch) < 0.5 && !dipAt(x, y)) { x.e = y.e; x.pitch = pitchOf(x.s, x.e); notes.splice(i, 1); i--; }
+  }
+
+  // 5) 同じ高さの連打（んーんー）は、音量の谷で分ける
+  const out = [];
+  for (const nt of notes) {
+    let segStart = nt.s, peak = 0, dipMin = Infinity, dipPos = -1, dipFrom = -1, inDip = false, first = true;
+    const maxDip = Math.round(0.25 / hopSec);
+    for (let f = nt.s; f < nt.e; f++) {
       const r = rms[f];
       if (!inDip) {
         if (r > peak) peak = r;
-        else if (r < peak * 0.4) { inDip = true; dipMin = r; dipPos = f; }
+        else if (r < peak * 0.55) { inDip = true; dipMin = r; dipPos = f; dipFrom = f; }
       } else if (r < dipMin) { dipMin = r; dipPos = f; }
-      else if (r > dipMin * 2 && r > peak * 0.5) {
-        if (dipPos - segStart >= minLen && sg.e - dipPos >= minLen) { segs2.push({ s: segStart, e: dipPos, soft: first ? sg.soft : false }); segStart = dipPos; first = false; }
+      else if (r > dipMin * 1.5 && r > peak * 0.5) {
+        if (f - dipFrom <= maxDip && dipPos - segStart >= minLen && nt.e - dipPos >= minLen) {
+          out.push({ s: segStart, e: dipPos, hard: first ? nt.hard : false, pitch: pitchOf(segStart, dipPos) });
+          segStart = dipPos; first = false;
+        }
         inDip = false; peak = r; dipMin = Infinity;
       }
     }
-    segs2.push({ s: segStart, e: sg.e, soft: first ? sg.soft : false });
+    out.push(first ? nt : { s: segStart, e: nt.e, hard: false, pitch: pitchOf(segStart, nt.e) });
   }
-
-  const pitchOf = (s, e) => {
-    const a = [], skip = Math.min(8, Math.floor((e - s) * 0.2));
-    for (let f = s + skip; f < e; f++) if (voiced[f]) a.push(midi[f]);
-    if (!a.length) for (let f = s; f < e; f++) if (voiced[f]) a.push(midi[f]);
-    return median(a);
-  };
-  let notes = segs2.map((g) => ({ s: g.s, e: g.e, soft: g.soft, pitch: pitchOf(g.s, g.e) })).filter((nt) => Number.isFinite(nt.pitch));
-
-  // 3) 短すぎる音は隣にくっつけるか捨てる
-  for (let i = 0; i < notes.length; i++) {
-    const nt = notes[i];
-    if (nt.e - nt.s >= minLen) continue;
-    const pv = notes[i - 1], nx = notes[i + 1];
-    if (nx && nx.s - nt.e <= 1 && Math.abs(nx.pitch - nt.pitch) <= 1.2) { nx.s = nt.s; nx.soft = nt.soft; nx.pitch = pitchOf(nx.s, nx.e); }
-    else if (pv && nt.s - pv.e <= 1 && Math.abs(pv.pitch - nt.pitch) <= 1.2) pv.e = nt.e;
-    notes.splice(i, 1); i--;
-  }
-  // 4) ビブラートで半音ゆれただけの短い音はまとめる
-  for (let i = 1; i < notes.length - 1; i++) {
-    const a = notes[i - 1], b = notes[i], c = notes[i + 1];
-    const dv = Math.abs(b.pitch - a.pitch);
-    if (b.s - a.e <= 1 && c.s - b.e <= 1 && Math.abs(a.pitch - c.pitch) < 0.5 && dv > 0.5 && dv < 1.6 && (b.e - b.s) * hopSec < 0.14) {
-      a.e = c.e; notes.splice(i, 2); i = Math.max(0, i - 1);
-    }
-  }
-  // 5) 音程のゆれで分かれただけの、ほぼ同じ高さの音はつなぐ
-  for (let i = 1; i < notes.length; i++) {
-    const a = notes[i - 1], b = notes[i];
-    if (b.soft && b.s - a.e <= 0 && Math.abs(a.pitch - b.pitch) < 0.35) { a.e = b.e; a.pitch = pitchOf(a.s, a.e); notes.splice(i, 1); i--; }
-  }
-  return notes;
+  return out.filter((nt) => Number.isFinite(nt.pitch));
 }
 
 // 歌い手の「基準の高さ」がA=440からどれだけずれているか（半音単位、-0.5〜0.5）
@@ -701,10 +734,33 @@ function fitTuning(items, hint) {
   return best.off;
 }
 
+// 歌っているうちに基準の高さがだんだんずれていく分に追従する。
+// 戻り値は、それぞれの音に使う「ずれ」の量（半音単位）。
+// 1音だけを見ると歌い間違いに引きずられるので、前後の音もまとめて見て、ゆっくりした変化だけを拾う。
+function trackTuning(notes, hint) {
+  const n = notes.length, offs = new Array(n).fill(hint);
+  // 短い鼻歌では、追従すると1音ごとの歌い間違いに引きずられて逆効果だった（テストで確認）。
+  // ずれが積み重なる長い録音（20音以上・24秒以上）のときだけ追従する
+  if (n < 20 || notes[n - 1].t1 - notes[0].t0 < 24) return offs;
+  // 1音ごとに、半音からのはみ出しぶんの一部だけ基準を動かす（ALPHAが小さいほどゆっくり追従）
+  const ALPHA = 0.15;
+  const step = (off, nt) => { const c = nt.pitch - off; return off + ALPHA * Math.min(1, (nt.t1 - nt.t0) / 0.3) * (c - Math.round(c)); };
+  // 前から→後ろから、とたどって出だしの基準を決め直してから、本番の1回を前からたどる
+  let off = hint;
+  for (let i = 0; i < n; i++) off = step(off, notes[i]);
+  for (let i = n - 1; i >= 0; i--) off = step(off, notes[i]);
+  const fwd = new Array(n), bwd = new Array(n);
+  for (let i = 0; i < n; i++) { fwd[i] = off; off = step(off, notes[i]); }
+  for (let i = n - 1; i >= 0; i--) { bwd[i] = off; off = step(off, notes[i]); }
+  // 前からの見立てと後ろからの見立てを平均して、遅れを打ち消す
+  for (let i = 0; i < n; i++) offs[i] = (fwd[i] + bwd[i]) / 2;
+  return offs;
+}
+
 async function analyze(samples, sr, mode, onProgress) {
   const x = highpass(samples);
   const track = mode === 'mix' ? await trackMix(x, sr, onProgress) : await trackMono(x, sr, onProgress);
-  const fr = buildNotes(track, mode === 'mix' ? 0.09 : 0.07);
+  const fr = buildNotes(track, 0.09);
   const tuning = fitTuning(fr.map((nt) => ({ pitch: nt.pitch, w: Math.min((nt.e - nt.s) * track.hopSec, 1.5) })), estimateTuning(track, fr));
   const tt = (f) => track.t0 + f * track.hopSec;
   const notes = fr.map((nt) => ({ t0: tt(nt.s), t1: tt(nt.e), pitch: nt.pitch }));
@@ -735,6 +791,8 @@ function makeKey(tonic, minor) {
 
 // 音の出現時間のかたよりから、いちばんそれらしいキーを選ぶ
 function detectKey(items) {
+  // どの音がどれだけ使われているかを集計する。
+  // （あいまいな音を両どなりに分けて数える案も試したが、的中率が下がったので採用していない）
   const h = new Array(12).fill(0);
   for (const it of items) h[mod12(Math.round(it.p))] += it.w;
   const corr = (prof, tonic) => {
@@ -765,7 +823,7 @@ function detectKey(items) {
   for (let t = 0; t < 12; t++) {
     for (const minor of [false, true]) {
       const key = makeKey(t, minor);
-      key.score = corr(minor ? KS_MIN : KS_MAJ, t) - 4 * strain(key);
+      key.score = corr(minor ? KS_MIN : KS_MAJ, t) - 6 * strain(key);   // 減点の重さは、人間らしい鼻歌240本で比べて決めた
       out.push(key);
     }
   }
@@ -880,16 +938,95 @@ function quantizeNotes(notes, bpm, unit, fill, pickup) {
     if (p && p.e > nt.s) p.e = nt.s;
     out.push(nt);
   }
+  return tidyQuantized(out, fill, pickup);
+}
+
+// そろえたあとの仕上げ: 重なりを切り、短い休符は前の音をのばして埋める
+function tidyQuantized(out, fill, pickup) {
+  for (let i = 0; i + 1 < out.length; i++) if (out[i].e > out[i + 1].s) out[i].e = out[i + 1].s;
   if (fill) {
     for (let i = 0; i < out.length; i++) {
       const nx = out[i + 1], gap = nx ? nx.s - out[i].e : Infinity;
       if (gap > 0 && gap <= 2) out[i].e = nx.s;
-      else if (gap > 0 && out[i].e % 2 !== 0) out[i].e += 1;
+      else if (gap > 0) {
+        // 休符の前や最後の音は、息つぎで早めに切れがち。8分音符ぶん以内なら拍の区切りまでのばす
+        const up = (4 - (out[i].e % 4)) % 4;
+        if (up > 0 && up <= 2 && up <= gap) out[i].e += up;
+      }
     }
   }
   const shift = (out[0].s < 0 ? 2 : 0) + pickup;
   for (const nt of out) { nt.s += shift; nt.e += shift; }
   return out;
+}
+
+// 8分音符1つぶんの長さ（秒）を、となりあう音の「出だしから出だしまでの間隔」から推定する。
+// 全体を一定のマス目に当てはめるやり方と違い、鼻歌のようにテンポが揺れても崩れにくい。
+function estimateUnit(onsets) {
+  const iois = [];
+  for (let i = 0; i + 1 < onsets.length; i++) { const d = onsets[i + 1] - onsets[i]; if (d > 0.06 && d < 2.5) iois.push(d); }
+  if (iois.length < 3) return { u: 0.3, R: 0 };
+  let best = { v: -Infinity, u: 0.3, R: 0 };
+  for (let u = 0.15; u <= 0.5; u *= 1.008) {
+    let c = 0;
+    for (const d of iois) c += Math.cos((2 * Math.PI * d) / u);
+    const R = c / iois.length, prior = Math.exp(-0.5 * Math.pow(Math.log2(30 / u / 105) / 0.6, 2));
+    const v = R * (0.35 + 0.65 * prior);
+    if (v > best.v) best = { v, u, R };
+  }
+  // 間隔を「8分音符いくつぶんか」に割り当てたうえで、いちばん合う長さに微調整する
+  let num = 0, den = 0;
+  for (const d of iois) { const k = Math.max(1, Math.round(d / best.u)); if (k <= 6) { num += d * k; den += k * k; } }
+  if (den > 0) best.u = clamp(num / den, best.u * 0.9, best.u * 1.1);
+  return best;
+}
+
+// 自由なテンポ向け: 1音ごとに「前の音から8分音符いくつぶん後か」を決めて並べていく。
+// 途中でテンポが変わっても、その先がまとめてずれることがない。
+function quantizeFree(notes, u, unit, fill, pickup) {
+  if (!notes.length) return [];
+  let ul = u, pos = 0, carry = 0; const out = [];
+  for (let i = 0; i < notes.length; i++) {
+    const nt = notes[i];
+    if (i > 0) {
+      const ioi = nt.t0 - notes[i - 1].t0;
+      // 丸めで切り上げた／切り捨てた半端ぶんは、次の音の間隔で取り戻す。
+      // 出だしが少し遅れた音の直後は間隔が短くなる、という人の歌い方のくせを打ち消せる
+      const raw = ioi / (ul / 2) + carry;
+      const k = Math.max(unit, Math.round(raw / unit) * unit);
+      carry = clamp(raw - k, -unit / 2, unit / 2) * 0.5;
+      pos += k;
+      if (k <= 8) ul += 0.2 * (clamp((ioi / k) * 2, ul * 0.85, ul * 1.18) - ul);   // テンポの変化に少しずつ追従
+    }
+    const len = Math.max(unit, Math.round((nt.t1 - nt.t0) / (ul / 2) / unit) * unit);
+    out.push({ s: pos, e: pos + len, midi: nt.midi, src: nt });
+  }
+  return tidyQuantized(out, fill, pickup);
+}
+
+// 聴きとった音と設定から、楽譜にのせる音符の並びを組み立てる
+function deriveNotes(notes, tuning, set) {
+  if (!notes || !notes.length) return null;
+  const offs = !set.tuneFix ? notes.map(() => 0) : set.driftFix === false ? notes.map(() => tuning) : trackTuning(notes, tuning);
+  const base = notes.map((nt, i) => ({ t0: nt.t0, t1: nt.t1, p: nt.pitch - offs[i] }));
+  const cands = detectKey(base.map((nt) => ({ p: nt.p, w: Math.min(nt.t1 - nt.t0, 1.5) })));
+  const key = set.key === 'auto' ? cands[0] : makeKey(set.key % 12, set.key >= 12);
+  for (const nt of base) { nt.raw = Math.round(nt.p); nt.midi = snapPitch(nt.p, key, set.snap); nt.fixed = nt.midi !== nt.raw; }
+  const onsets = base.map((nt) => nt.t0);
+  let bpm, q;
+  if (set.free) {
+    const u = set.bpm === 'auto' ? estimateUnit(onsets).u : 30 / set.bpm;
+    q = quantizeFree(base, u, set.grid, set.fill, set.pickup);
+    bpm = set.bpm === 'auto' ? Math.round(30 / u) : set.bpm;
+  } else {
+    bpm = set.bpm === 'auto' ? estimateTempo(onsets).bpm : set.bpm;
+    q = quantizeNotes(base, bpm, set.grid, set.fill, set.pickup);
+  }
+  const oct = set.octave === 'auto' ? Math.round((65 - median(base.map((nt) => nt.midi))) / 12) : set.octave;
+  for (const nt of q) nt.out = nt.midi + 12 * oct;
+  let lo = Infinity, hi = -Infinity;
+  for (const o of offs) { if (o < lo) lo = o; if (o > hi) hi = o; }
+  return { key, cands, bpm, oct, q, meter: set.meter, tune: set.tuneFix ? tuning : 0, drift: hi - lo };
 }
 
 /* ============================================================
@@ -984,24 +1121,11 @@ function buildMidi(d) {
 const state = {
   samples: null, origBuf: null, label: '', mode: 'mono',
   track: null, notes: null, tuning: 0, duration: 0,
-  settings: { key: 'auto', bpm: 'auto', meter: 4, grid: 1, snap: 1, octave: 'auto', pickup: 0, fill: true, tuneFix: true, title: '', solfa: 'movable', solfaOn: true },
+  settings: { key: 'auto', bpm: 'auto', meter: 4, grid: 2, free: true, snap: 1, octave: 'auto', pickup: 0, fill: true, tuneFix: true, title: '', solfa: 'movable', solfaOn: true },
   derived: null, visual: null, pps: 80,
 };
 
-function derive() {
-  const st = state, set = st.settings;
-  if (!st.notes || !st.notes.length) return null;
-  const tune = set.tuneFix ? st.tuning : 0;
-  const base = st.notes.map((nt) => ({ t0: nt.t0, t1: nt.t1, p: nt.pitch - tune }));
-  const cands = detectKey(base.map((nt) => ({ p: nt.p, w: Math.min(nt.t1 - nt.t0, 1.5) })));
-  const key = set.key === 'auto' ? cands[0] : makeKey(set.key % 12, set.key >= 12);
-  for (const nt of base) { nt.raw = Math.round(nt.p); nt.midi = snapPitch(nt.p, key, set.snap); nt.fixed = nt.midi !== nt.raw; }
-  const tempo = set.bpm === 'auto' ? estimateTempo(base.map((nt) => nt.t0)) : { bpm: set.bpm };
-  const oct = set.octave === 'auto' ? Math.round((65 - median(base.map((nt) => nt.midi))) / 12) : set.octave;
-  const q = quantizeNotes(base, tempo.bpm, set.grid, set.fill, set.pickup);
-  for (const nt of q) nt.out = nt.midi + 12 * oct;
-  return { key, cands, bpm: tempo.bpm, oct, q, meter: set.meter, tune };
-}
+function derive() { return deriveNotes(state.notes, state.tuning, state.settings); }
 
 /* ============================================================
    画面: 結果の表示
@@ -1014,8 +1138,8 @@ function renderStats(d) {
   const fixed = d.q.filter((nt) => nt.src.fixed).length;
   const rows = [
     ['キー', d.key.label, alt],
-    ['テンポ', '♩= ' + d.bpm, state.settings.bpm === 'auto' ? '自動で推定' : '手動で指定'],
-    ['音程のずれ', sign + Math.abs(cents) + '¢', state.settings.tuneFix ? 'そろえて採譜' : '補正なし'],
+    ['テンポ', '♩= ' + d.bpm, (state.settings.bpm === 'auto' ? '自動で推定' : '手動で指定') + (state.settings.free ? '・自由なテンポ' : '・一定のテンポ')],
+    ['音程のずれ', sign + Math.abs(cents) + '¢', !state.settings.tuneFix ? '補正なし' : d.drift > 0.15 ? '途中のずれにも追従して採譜' : 'そろえて採譜'],
     ['音符', d.q.length + ' 個', fixed ? 'うち ' + fixed + ' 個をスケールに補正' : 'スケール補正なし'],
     ['音域', noteName(lo, d.key) + ' 〜 ' + noteName(hi, d.key), d.oct ? 'オクターブ ' + (d.oct > 0 ? '+' : '−') + Math.abs(d.oct) + ' で表示' : '聴こえた高さのまま'],
   ];
@@ -1283,6 +1407,9 @@ async function toMono16k(buf) {
     const oac = new OAC(1, len, SR), src = oac.createBufferSource();
     src.buffer = buf; src.connect(oac.destination); src.start(0);
     const out = await oac.startRendering();
+    // 念のため、本当に16kHzで仕上がったかを確かめる。違っていたら下の自前の方法でやり直す
+    // （ここが狂うと、音の高さも長さも全部ずれてしまうため）
+    if (Math.abs(out.sampleRate - SR) > 1 || out.length < len * 0.9) throw new Error('unexpected sample rate');
     return out.getChannelData(0).slice(0, len);
   } catch (e) {
     // うまくいかない環境では、自前で平均をとりながら間引く
@@ -1305,8 +1432,11 @@ async function runAnalysis(samples, label, origBuf, fixedBpm, quiet, title) {
     const res = await analyze(samples, SR, mode, (p) => { $('progBar').style.width = Math.round(p * 100) + '%'; });
     if (!res.notes.length) { showMsg('音符が見つかりませんでした。もう少し大きめの声で、はっきり歌った音で試してみてください。'); return; }
     Object.assign(state, res, { samples, origBuf: origBuf || null, label, mode });
-    Object.assign(state.settings, { key: 'auto', bpm: fixedBpm || 'auto', octave: 'auto', pickup: 0, title: title || label.replace(/\.[a-z0-9]{2,5}$/i, '') });
+    // クリックに合わせた録音と伴奏入りの曲は「一定のテンポ」、それ以外（鼻歌）は「自由なテンポ」で読む
+    const free = !fixedBpm && mode !== 'mix';
+    Object.assign(state.settings, { key: 'auto', bpm: fixedBpm || 'auto', octave: 'auto', pickup: 0, free, grid: free ? 2 : 1, title: title || label.replace(/\.[a-z0-9]{2,5}$/i, '') });
     $('keySel').value = 'auto'; $('octSel').value = 'auto'; $('pickSel').value = '0';
+    $('rhythmSel').value = free ? 'free' : 'grid'; $('gridSel').value = String(state.settings.grid);
     $('bpmAuto').checked = !fixedBpm; $('titleInp').value = state.settings.title;
     $('srcLabel').textContent = label;
     $('resultCard').hidden = false;
@@ -1552,6 +1682,7 @@ function init() {
   $('bpmDouble').onclick = scaleBpm(2);
   $('meterSel').onchange = upd(() => { set.meter = parseInt($('meterSel').value, 10); });
   $('gridSel').onchange = upd(() => { set.grid = parseInt($('gridSel').value, 10); });
+  $('rhythmSel').onchange = upd(() => { set.free = $('rhythmSel').value === 'free'; });
   $('snapSel').onchange = upd(() => { set.snap = parseInt($('snapSel').value, 10); });
   $('octSel').onchange = upd(() => { const v = $('octSel').value; set.octave = v === 'auto' ? 'auto' : parseInt(v, 10); });
   $('pickSel').onchange = upd(() => { set.pickup = parseInt($('pickSel').value, 10); });
@@ -1570,6 +1701,18 @@ function init() {
   $('titleInp').oninput = () => { set.title = $('titleInp').value; if (state.derived) renderScore(state.derived); };
 
   $('midiBtn').onclick = () => { if (state.derived) saveBlob(new Blob([buildMidi(state.derived)], { type: 'audio/midi' }), safeName(set.title) + '.mid'); };
+  // ツールが実際に聴いた音そのもの（16kHz・モノラル）をWAVで書き出す。うまく採譜できないときの原因調べに使う
+  $('wavBtn').onclick = () => {
+    if (!state.samples) return;
+    const x = state.samples, buf = new ArrayBuffer(44 + x.length * 2), dv = new DataView(buf);
+    const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+    str(0, 'RIFF'); dv.setUint32(4, 36 + x.length * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, SR, true); dv.setUint32(28, SR * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    str(36, 'data'); dv.setUint32(40, x.length * 2, true);
+    for (let i = 0; i < x.length; i++) dv.setInt16(44 + i * 2, Math.round(clamp(x[i], -1, 1) * 32767), true);
+    saveBlob(new Blob([buf], { type: 'audio/wav' }), safeName(set.title) + '.wav');
+  };
   $('pngBtn').onclick = async () => {
     if (!state.derived) return;
     try { await saveBlob(await scoreToPngBlob(), safeName(set.title) + '.png'); }
